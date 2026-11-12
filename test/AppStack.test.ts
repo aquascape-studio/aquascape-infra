@@ -38,6 +38,8 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
       domainName: "example.com",
       vpc,
       certificate,
+      // Exercise the ALB path here; the no-ALB dev path is covered below.
+      useAlb: true,
     });
 
     template = Template.fromStack(appStack);
@@ -72,11 +74,11 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
 
   // ── Fargate task definition ───────────────────────────────────────────────
 
-  test("Web Fargate task definition has 0.5 vCPU (512) and 1 GB (1024 MiB) memory", () => {
+  test("Web Fargate task definition has 0.25 vCPU (256) and 0.5 GB (512 MiB) memory in dev", () => {
     template.hasResourceProperties("AWS::ECS::TaskDefinition", {
       Family: `aquascape-web-${envName}`,
-      Cpu: "512",
-      Memory: "1024",
+      Cpu: "256",
+      Memory: "512",
     });
   });
 
@@ -125,17 +127,21 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
 
   // ── Fargate service ───────────────────────────────────────────────────────
 
-  test("Web Fargate service exists", () => {
+  test("Web Fargate service exists on Fargate Spot in dev", () => {
     template.hasResourceProperties("AWS::ECS::Service", {
       ServiceName: `aquascape-web-${envName}`,
-      LaunchType: "FARGATE",
+      CapacityProviderStrategy: [{ CapacityProvider: "FARGATE_SPOT", Weight: 1 }],
     });
   });
 
-  test("Web service autoscaling target is configured (min 1 / max 4)", () => {
+  test("Web service autoscaling target is configured (min 1 / max 1) with dev window schedule", () => {
     template.hasResourceProperties("AWS::ApplicationAutoScaling::ScalableTarget", {
       MinCapacity: 1,
-      MaxCapacity: 4,
+      MaxCapacity: 1,
+      ScheduledActions: Match.arrayWith([
+        Match.objectLike({ ScheduledActionName: "WebWake", Schedule: "cron(30 1 * * ? *)" }),
+        Match.objectLike({ ScheduledActionName: "WebSleep", Schedule: "cron(0 4 * * ? *)" }),
+      ]),
     });
   });
 
@@ -178,6 +184,57 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
     template.hasResourceProperties("AWS::ElasticLoadBalancingV2::TargetGroup", {
       Port: 3000,
       HealthCheckPath: "/healthz",
+    });
+  });
+});
+
+describe("AppStack — no ALB (dev default)", () => {
+  let template: Template;
+
+  beforeAll(() => {
+    const app = new cdk.App();
+    const envProps = { account: "123456789012", region: "us-east-1" };
+    const networkStack = new cdk.Stack(app, "TestNetworkStack", { env: envProps });
+    const vpc = new Vpc(networkStack, "TestVpc", { maxAzs: 2, natGateways: 0 });
+    const certStack = new cdk.Stack(app, "TestCertStack", { env: envProps });
+    const certificate = Certificate.fromCertificateArn(
+      certStack,
+      "TestCert",
+      "arn:aws:acm:us-east-1:123456789012:certificate/test-cert-id",
+    );
+    const appStack = new AppStack(app, "TestAppStack", {
+      env: envProps,
+      envName: "dev",
+      domainName: "example.com",
+      vpc,
+      certificate,
+      useAlb: false,
+    });
+    template = Template.fromStack(appStack);
+  });
+
+  test("has no load balancer or target groups", () => {
+    template.resourceCountIs("AWS::ElasticLoadBalancingV2::LoadBalancer", 0);
+    template.resourceCountIs("AWS::ElasticLoadBalancingV2::TargetGroup", 0);
+  });
+
+  test("web SG admits CloudFront origin-facing prefix list on 3000", () => {
+    template.hasResourceProperties("AWS::EC2::SecurityGroupIngress", {
+      SourcePrefixListId: "pl-3b927c52",
+      FromPort: 3000,
+      ToPort: 3000,
+    });
+  });
+
+  test("web task start triggers the origin DNS updater", () => {
+    template.hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: Match.objectLike({
+        "detail-type": ["ECS Task State Change"],
+        detail: Match.objectLike({ lastStatus: ["RUNNING"] }),
+      }),
+    });
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: { Variables: Match.objectLike({ RECORD_NAME: "origin-dev.example.com" }) },
     });
   });
 });

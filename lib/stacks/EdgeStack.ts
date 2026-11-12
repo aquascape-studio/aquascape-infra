@@ -55,6 +55,9 @@ export class EdgeStack extends Stack {
         props.envName === "prod" ? [`www.${props.domainName}`] : undefined,
       validation: CertificateValidation.fromDns(this.hostedZone),
     });
+    // Keep the cert export alive even when AppStack stops importing it
+    // (no-ALB envs), so Edge can deploy before App drops the import.
+    this.exportValue(this.certificate.certificateArn);
 
     this.siteBucket = new Bucket(this, "SiteBucket", {
       bucketName: `aquascape-studio-site-${props.envName}-${this.account}`,
@@ -67,7 +70,8 @@ export class EdgeStack extends Stack {
 
     // WAF WebACL (CloudFront scope must be in us-east-1, same as this stack).
     // Rules: AWS Managed Common + IP Reputation + rate limit per IP.
-    const waf = new CfnWebACL(this, "Waf", {
+    // Prod only (~$9/mo); dev relies on CloudFront alone.
+    const waf = props.envName !== "prod" ? undefined : new CfnWebACL(this, "Waf", {
       name: `aquascape-${props.envName}`,
       scope: "CLOUDFRONT",
       defaultAction: { allow: {} },
@@ -146,7 +150,7 @@ export class EdgeStack extends Stack {
       httpVersion: HttpVersion.HTTP2_AND_3,
 
       enableLogging: props.envName === "prod",
-      webAclId: waf.attrArn,
+      webAclId: waf?.attrArn,
     });
 
     new ARecord(this, "AliasA", {
@@ -196,6 +200,31 @@ export class EdgeStack extends Stack {
 
     for (const pattern of ["/grpc/*", "/api/*", "/*"]) {
       this.distribution.addBehavior(pattern, albOrigin, {
+        viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        allowedMethods: AllowedMethods.ALLOW_ALL,
+        cachePolicy: CachePolicy.CACHING_DISABLED,
+        originRequestPolicy: OriginRequestPolicy.ALL_VIEWER,
+        compress: true,
+      });
+    }
+  }
+
+  /**
+   * No-ALB variant: send app paths straight to the web task at `hostname`
+   * (kept current by AppStack's WebOriginDns Lambda). Plain HTTP on :3000;
+   * the task SG only admits CloudFront's origin-facing prefix list.
+   * No /grpc/* behavior until api ships a real image.
+   */
+  wireTaskOriginBehaviors(hostname: string): void {
+    const taskOrigin = new HttpOrigin(hostname, {
+      protocolPolicy: OriginProtocolPolicy.HTTP_ONLY,
+      httpPort: 3000,
+      readTimeout: Duration.seconds(60),
+      keepaliveTimeout: Duration.seconds(5),
+    });
+
+    for (const pattern of ["/api/*", "/*"]) {
+      this.distribution.addBehavior(pattern, taskOrigin, {
         viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         allowedMethods: AllowedMethods.ALLOW_ALL,
         cachePolicy: CachePolicy.CACHING_DISABLED,
