@@ -1,4 +1,4 @@
-import { Stack, StackProps, RemovalPolicy, Duration, CfnOutput, Tags } from "aws-cdk-lib";
+import { Stack, StackProps, RemovalPolicy, Duration, CfnOutput, Tags, TimeZone } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import { IVpc, Peer, Port, SecurityGroup, SubnetType } from "aws-cdk-lib/aws-ec2";
 import {
@@ -8,7 +8,9 @@ import {
   ContainerImage,
   LogDriver,
   Protocol as EcsProtocol,
+  CapacityProviderStrategy,
 } from "aws-cdk-lib/aws-ecs";
+import { Schedule } from "aws-cdk-lib/aws-applicationautoscaling";
 import {
   ApplicationLoadBalancer,
   ApplicationProtocol,
@@ -79,11 +81,21 @@ export class AppStack extends Stack {
     const env = props.envName;
     const commonTags = { project: "aquascape-studio", env };
 
+    // Non-prod runs at minimum size: 0.25 vCPU / 0.5 GB, public subnets (no NAT).
+    const taskCpu = isProd ? 512 : 256;
+    const taskMemory = isProd ? 1024 : 512;
+    const taskSubnets = { subnetType: isProd ? SubnetType.PRIVATE_WITH_EGRESS : SubnetType.PUBLIC };
+    // Non-prod runs on Fargate Spot (~70% cheaper; tasks may be reclaimed and restarted).
+    const capacityProviderStrategies: CapacityProviderStrategy[] | undefined = isProd
+      ? undefined
+      : [{ capacityProvider: "FARGATE_SPOT", weight: 1 }];
+
     // ---- Cluster ----
     this.cluster = new Cluster(this, "Cluster", {
       clusterName: `aquascape-${env}`,
       vpc: props.vpc,
       containerInsights: isProd,
+      enableFargateCapacityProviders: true,
       // Cloud Map namespace for internal service discovery (api → sim).
       defaultCloudMapNamespace: {
         name: "aquascape.local",
@@ -212,12 +224,12 @@ export class AppStack extends Stack {
       });
 
     // ---- WEB service (Next.js) ----
-    // 0.5 vCPU / 1 GB, scoped task role: SSM read + CloudWatch logs write
+    // 0.5 vCPU / 1 GB in prod (0.25 / 0.5 GB otherwise), scoped task role: SSM read + CloudWatch logs write
     const webLogs = mkLogGroup("web");
     const webTask = new FargateTaskDefinition(this, "WebTaskDef", {
       family: `aquascape-web-${env}`,
-      cpu: 512,   // 0.5 vCPU
-      memoryLimitMiB: 1024,
+      cpu: taskCpu,
+      memoryLimitMiB: taskMemory,
     });
     Tags.of(webTask).add("project", commonTags.project);
     Tags.of(webTask).add("env", env);
@@ -289,8 +301,9 @@ export class AppStack extends Stack {
       desiredCount: isProd ? 2 : 1,
       minHealthyPercent: isProd ? 50 : 0,
       maxHealthyPercent: 200,
-      assignPublicIp: false,
-      vpcSubnets: { subnetType: SubnetType.PRIVATE_WITH_EGRESS },
+      assignPublicIp: !isProd,
+      vpcSubnets: taskSubnets,
+      capacityProviderStrategies,
       securityGroups: [webSg],
       enableExecuteCommand: !isProd,
       // Circuit breaker omitted: placeholder image won't pass health checks until real
@@ -301,7 +314,7 @@ export class AppStack extends Stack {
     Tags.of(this.webService).add("env", env);
 
     // ---- Autoscaling: web service (min 1 / max 4, CPU target 60%) ----
-    const webScaling = this.webService.autoScaleTaskCount({ minCapacity: 1, maxCapacity: 4 });
+    const webScaling = this.webService.autoScaleTaskCount({ minCapacity: 1, maxCapacity: isProd ? 4 : 1 });
     webScaling.scaleOnCpuUtilization("WebCpuScaling", {
       targetUtilizationPercent: 60,
       scaleInCooldown: Duration.seconds(60),
@@ -312,8 +325,8 @@ export class AppStack extends Stack {
     const apiLogs = mkLogGroup("api");
     const apiTask = new FargateTaskDefinition(this, "ApiTaskDef", {
       family: `aquascape-api-${props.envName}`,
-      cpu: 512,
-      memoryLimitMiB: 1024,
+      cpu: taskCpu,
+      memoryLimitMiB: taskMemory,
     });
     scapesTable.grantReadWriteData(apiTask.taskRole);
     speciesTable.grantReadData(apiTask.taskRole);
@@ -349,11 +362,13 @@ export class AppStack extends Stack {
       serviceName: `aquascape-api-${props.envName}`,
       cluster: this.cluster,
       taskDefinition: apiTask,
-      desiredCount: isProd ? 2 : 1,
+      // Non-prod: 0 until a real api image ships (currently the nginx placeholder).
+      desiredCount: isProd ? 2 : 0,
       minHealthyPercent: isProd ? 50 : 0,
       maxHealthyPercent: 200,
-      assignPublicIp: false,
-      vpcSubnets: { subnetType: SubnetType.PRIVATE_WITH_EGRESS },
+      assignPublicIp: !isProd,
+      vpcSubnets: taskSubnets,
+      capacityProviderStrategies,
       securityGroups: [apiSg],
       enableExecuteCommand: !isProd,
       healthCheckGracePeriod: Duration.seconds(300),
@@ -363,8 +378,8 @@ export class AppStack extends Stack {
     const simLogs = mkLogGroup("sim");
     const simTask = new FargateTaskDefinition(this, "SimTaskDef", {
       family: `aquascape-sim-${props.envName}`,
-      cpu: 512,
-      memoryLimitMiB: 1024,
+      cpu: taskCpu,
+      memoryLimitMiB: taskMemory,
     });
     simRepo.grantPull(simTask.obtainExecutionRole());
     simTask.addContainer("sim", {
@@ -394,8 +409,9 @@ export class AppStack extends Stack {
       desiredCount: 1,
       minHealthyPercent: 0,
       maxHealthyPercent: 200,
-      assignPublicIp: false,
-      vpcSubnets: { subnetType: SubnetType.PRIVATE_WITH_EGRESS },
+      assignPublicIp: !isProd,
+      vpcSubnets: taskSubnets,
+      capacityProviderStrategies,
       securityGroups: [simSg],
       enableExecuteCommand: !isProd,
       cloudMapOptions: {
@@ -403,6 +419,28 @@ export class AppStack extends Stack {
         containerPort: 50052,
       },
     });
+
+    // ---- Non-prod dev window: run daily 01:30–04:00 Pacific, scale to 0 otherwise ----
+    // Covers the "aquascape 每日迭代" Claude routine (daily 01:51 PST).
+    // Wake manually outside the window: scripts/wake-dev.sh
+    if (!isProd) {
+      const tz = TimeZone.AMERICA_LOS_ANGELES;
+      const simScaling = this.simService.autoScaleTaskCount({ minCapacity: 1, maxCapacity: 1 });
+      for (const [name, scaling] of [["Web", webScaling], ["Sim", simScaling]] as const) {
+        scaling.scaleOnSchedule(`${name}Wake`, {
+          schedule: Schedule.cron({ minute: "30", hour: "1" }),
+          timeZone: tz,
+          minCapacity: 1,
+          maxCapacity: 1,
+        });
+        scaling.scaleOnSchedule(`${name}Sleep`, {
+          schedule: Schedule.cron({ minute: "0", hour: "4" }),
+          timeZone: tz,
+          minCapacity: 0,
+          maxCapacity: 0,
+        });
+      }
+    }
 
     // ---- ALB target groups + listeners ----
     const webTg = new ApplicationTargetGroup(this, "WebTg", {

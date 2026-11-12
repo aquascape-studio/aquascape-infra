@@ -16,11 +16,12 @@ export class NetworkStack extends Stack {
 
     this.vpc = new Vpc(this, "Vpc", {
       maxAzs: 2,
-      natGateways: isProd ? 2 : 1,
+      // Non-prod: no NAT (~$37/mo). Tasks run in public subnets with public IPs instead.
+      natGateways: isProd ? 2 : 0,
       natGatewayProvider: NatProvider.gateway(),
       subnetConfiguration: [
         { name: "public",  cidrMask: 24, subnetType: SubnetType.PUBLIC },
-        { name: "private", cidrMask: 22, subnetType: SubnetType.PRIVATE_WITH_EGRESS },
+        { name: "private", cidrMask: 22, subnetType: isProd ? SubnetType.PRIVATE_WITH_EGRESS : SubnetType.PRIVATE_ISOLATED },
       ],
     });
     this.vpc.applyRemovalPolicy(isProd ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY);

@@ -72,11 +72,11 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
 
   // ── Fargate task definition ───────────────────────────────────────────────
 
-  test("Web Fargate task definition has 0.5 vCPU (512) and 1 GB (1024 MiB) memory", () => {
+  test("Web Fargate task definition has 0.25 vCPU (256) and 0.5 GB (512 MiB) memory in dev", () => {
     template.hasResourceProperties("AWS::ECS::TaskDefinition", {
       Family: `aquascape-web-${envName}`,
-      Cpu: "512",
-      Memory: "1024",
+      Cpu: "256",
+      Memory: "512",
     });
   });
 
@@ -125,17 +125,21 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
 
   // ── Fargate service ───────────────────────────────────────────────────────
 
-  test("Web Fargate service exists", () => {
+  test("Web Fargate service exists on Fargate Spot in dev", () => {
     template.hasResourceProperties("AWS::ECS::Service", {
       ServiceName: `aquascape-web-${envName}`,
-      LaunchType: "FARGATE",
+      CapacityProviderStrategy: [{ CapacityProvider: "FARGATE_SPOT", Weight: 1 }],
     });
   });
 
-  test("Web service autoscaling target is configured (min 1 / max 4)", () => {
+  test("Web service autoscaling target is configured (min 1 / max 1) with dev window schedule", () => {
     template.hasResourceProperties("AWS::ApplicationAutoScaling::ScalableTarget", {
       MinCapacity: 1,
-      MaxCapacity: 4,
+      MaxCapacity: 1,
+      ScheduledActions: Match.arrayWith([
+        Match.objectLike({ ScheduledActionName: "WebWake", Schedule: "cron(30 1 * * ? *)" }),
+        Match.objectLike({ ScheduledActionName: "WebSleep", Schedule: "cron(0 4 * * ? *)" }),
+      ]),
     });
   });
 

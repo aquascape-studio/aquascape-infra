@@ -67,7 +67,8 @@ export class EdgeStack extends Stack {
 
     // WAF WebACL (CloudFront scope must be in us-east-1, same as this stack).
     // Rules: AWS Managed Common + IP Reputation + rate limit per IP.
-    const waf = new CfnWebACL(this, "Waf", {
+    // Prod only (~$9/mo); dev relies on CloudFront alone.
+    const waf = props.envName !== "prod" ? undefined : new CfnWebACL(this, "Waf", {
       name: `aquascape-${props.envName}`,
       scope: "CLOUDFRONT",
       defaultAction: { allow: {} },
@@ -146,7 +147,7 @@ export class EdgeStack extends Stack {
       httpVersion: HttpVersion.HTTP2_AND_3,
 
       enableLogging: props.envName === "prod",
-      webAclId: waf.attrArn,
+      webAclId: waf?.attrArn,
     });
 
     new ARecord(this, "AliasA", {
