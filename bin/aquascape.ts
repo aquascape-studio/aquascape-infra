@@ -4,7 +4,7 @@ import * as cdk from "aws-cdk-lib";
 import { BootstrapStack } from "../lib/stacks/BootstrapStack";
 import { NetworkStack } from "../lib/stacks/NetworkStack";
 import { EdgeStack } from "../lib/stacks/EdgeStack";
-import { AppStack, albDnsExportName } from "../lib/stacks/AppStack";
+import { AppStack, albDnsExportName, taskOriginHostname } from "../lib/stacks/AppStack";
 
 const app = new cdk.App();
 
@@ -41,6 +41,10 @@ const common = {
   domainName: DOMAIN,
 };
 
+// ALB only in prod for now; dev goes CloudFront → web task directly.
+// Set true for an env when it needs to scale beyond one task.
+const useAlb = envName === "prod";
+
 const network = new NetworkStack(app, `AquascapeStudio-Network-${envName}`, common);
 const edge = new EdgeStack(app, `AquascapeStudio-Edge-${envName}`, {
   ...common,
@@ -50,11 +54,16 @@ const appStack = new AppStack(app, `AquascapeStudio-App-${envName}`, {
   ...common,
   vpc: network.vpc,
   certificate: edge.certificate,
+  useAlb,
 });
 appStack.addDependency(network);
 appStack.addDependency(edge);
 
-// Wire CloudFront → ALB behaviors AFTER AppStack is created.
-edge.wireAlbBehaviors(albDnsExportName(envName));
+// Wire CloudFront → ALB (or web task) behaviors AFTER AppStack is created.
+if (useAlb) {
+  edge.wireAlbBehaviors(albDnsExportName(envName));
+} else {
+  edge.wireTaskOriginBehaviors(taskOriginHostname(envName, DOMAIN));
+}
 
 app.synth();

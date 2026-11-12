@@ -38,6 +38,8 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
       domainName: "example.com",
       vpc,
       certificate,
+      // Exercise the ALB path here; the no-ALB dev path is covered below.
+      useAlb: true,
     });
 
     template = Template.fromStack(appStack);
@@ -182,6 +184,57 @@ describe("AppStack — aquascape-web ECS Fargate feature", () => {
     template.hasResourceProperties("AWS::ElasticLoadBalancingV2::TargetGroup", {
       Port: 3000,
       HealthCheckPath: "/healthz",
+    });
+  });
+});
+
+describe("AppStack — no ALB (dev default)", () => {
+  let template: Template;
+
+  beforeAll(() => {
+    const app = new cdk.App();
+    const envProps = { account: "123456789012", region: "us-east-1" };
+    const networkStack = new cdk.Stack(app, "TestNetworkStack", { env: envProps });
+    const vpc = new Vpc(networkStack, "TestVpc", { maxAzs: 2, natGateways: 0 });
+    const certStack = new cdk.Stack(app, "TestCertStack", { env: envProps });
+    const certificate = Certificate.fromCertificateArn(
+      certStack,
+      "TestCert",
+      "arn:aws:acm:us-east-1:123456789012:certificate/test-cert-id",
+    );
+    const appStack = new AppStack(app, "TestAppStack", {
+      env: envProps,
+      envName: "dev",
+      domainName: "example.com",
+      vpc,
+      certificate,
+      useAlb: false,
+    });
+    template = Template.fromStack(appStack);
+  });
+
+  test("has no load balancer or target groups", () => {
+    template.resourceCountIs("AWS::ElasticLoadBalancingV2::LoadBalancer", 0);
+    template.resourceCountIs("AWS::ElasticLoadBalancingV2::TargetGroup", 0);
+  });
+
+  test("web SG admits CloudFront origin-facing prefix list on 3000", () => {
+    template.hasResourceProperties("AWS::EC2::SecurityGroupIngress", {
+      SourcePrefixListId: "pl-3b927c52",
+      FromPort: 3000,
+      ToPort: 3000,
+    });
+  });
+
+  test("web task start triggers the origin DNS updater", () => {
+    template.hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: Match.objectLike({
+        "detail-type": ["ECS Task State Change"],
+        detail: Match.objectLike({ lastStatus: ["RUNNING"] }),
+      }),
+    });
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      Environment: { Variables: Match.objectLike({ RECORD_NAME: "origin-dev.example.com" }) },
     });
   });
 });
