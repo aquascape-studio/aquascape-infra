@@ -447,7 +447,7 @@ export class AppStack extends Stack {
     });
 
     // ---- Non-prod dev window: run daily 01:30–04:00 Pacific, scale to 0 otherwise ----
-    // Covers the "aquascape 每日迭代" Claude routine (daily 01:51 PST).
+    // Covers the daily-iteration Claude routine (daily 01:51 PST).
     // Wake manually outside the window: scripts/wake-dev.sh
     if (!isProd) {
       const tz = TimeZone.AMERICA_LOS_ANGELES;
